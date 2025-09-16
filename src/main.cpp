@@ -1,27 +1,31 @@
-#include <esp_now.h>
+﻿#include <Arduino.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <esp_mac.h>
-#include <Preferences.h>
-#include <Arduino.h>
+#include <esp_now.h>
+#include <esp_timer.h>
 #include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
+#include <esp_pm.h>
 
-// config
-constexpr uint8_t NUM_LEDS = 1;
-constexpr uint32_t DEEP_SLEEP_TIMEOUT = 5 * 1000000; // 10 Sekunden in µs
-constexpr uint16_t WAKE_UP_TIME = 300;
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
 constexpr uint8_t BATTERY_PIN = 0;
 constexpr uint8_t LED_CONTROL_PIN = 22;
-constexpr uint8_t LED_BUILTIN_PIN = 10; // On-board LED for status indication
+constexpr uint8_t LED_BUILTIN_PIN = 10;
+constexpr uint32_t ACTIVE_WINDOW_MS = 1000;                               // awake time per burst
+constexpr uint64_t SLEEP_INTERVAL_US = 5ULL * 1000000ULL;                 // 60 seconds
+constexpr uint64_t STATE_PERSIST_INTERVAL_US = 5ULL * 60ULL * 1000000ULL; // 5 minutes
 
-// ESPNOW master channel (override via -D MASTER_CHANNEL=<n>)
 #ifndef MASTER_CHANNEL
 #define MASTER_CHANNEL 0
 #endif
 
-// Debug settings
-// #define DEBUG_MODE // Comment out for production
-
-// Protocol: header + payloads aligned with master
+// -----------------------------------------------------------------------------
+// Protocol primitives
+// -----------------------------------------------------------------------------
 #pragma pack(push, 1)
 enum MsgType : uint8_t
 {
@@ -32,385 +36,423 @@ enum MsgType : uint8_t
 
 struct MsgHdr
 {
-  uint8_t magic;   // 0xA5
-  uint8_t version; // 0x01
-  uint8_t type;    // MsgType
-  uint8_t channel; // 0..N-1
-  uint16_t len;    // payload length
-  uint16_t seq;    // sequence id
-  uint16_t crc;    // CRC16-CCITT over header(with crc=0) XOR payload CRC
+  uint8_t magic;
+  uint8_t version;
+  uint8_t type;
+  uint8_t channel;
+  uint16_t len;
+  uint16_t seq;
+  uint16_t crc;
 };
 
 struct CmdPayload
 {
-  uint16_t brightness; // 0..100
-  uint8_t state;       // 0/1
-  uint8_t reqTelem;    // 0/1
+  uint16_t brightness;
+  uint8_t state;
+  uint8_t reqTelem;
 };
 
 struct TelemetryPayload
 {
-  uint16_t appliedBrightness; // 0..100 actually set
-  uint8_t appliedState;       // 0/1 actually set
-  uint16_t halfVoltageMv;     // half of battery voltage in mV
-  uint32_t operatingHours;    // total operating hours
-  uint32_t lastChargedDate;   // device-defined
+  uint16_t appliedBrightness;
+  uint8_t appliedState;
+  uint16_t halfVoltageMv;
+  uint32_t operatingSeconds;
+  uint32_t lastChargedDate;
 };
 #pragma pack(pop)
 
-// global variables
-esp_now_peer_info_t peerInfo{};
-static uint16_t currentBrightness = 0;
-static bool currentState = false;
-uint8_t senderMac[6] = {0};
-Preferences preferences;
-
-static bool pwmInit = false;
-constexpr uint8_t PWM_CHANNEL = 0;
-constexpr uint32_t PWM_FREQ = 5000; // Hz
-constexpr uint8_t PWM_RES = 8;      // bits -> 0..20
-
-// Operating time tracking: accumulate only when LED is ON, incl. deep sleep
-static uint32_t baseTotalSeconds = 0; // persisted total seconds loaded at boot
-static uint32_t sessionStartMs = 0;   // legacy, not used for accumulation anymore
-static uint32_t onStartMs = 0;        // millis() when LED was last turned ON in this wake session
-
-// function definitions
-void updateLedState(uint8_t brightness, bool state);
-void receiveMessage(const esp_now_recv_info *info, const uint8_t *data, int len);
-void initEspNow();
-void updatePeerConnection();
-void sendAck(uint16_t seq, uint8_t channel);
-void sendTelemetry(uint8_t channel, uint16_t seq);
-void initHardware();
-void enterDeepSleep();
-void resumeRadio();
-void printMacAddress();
-void saveStatus();
-void loadStatus();
-static uint32_t getCurrentTotalSeconds();
-
-// function implementations
-
-void updateLedState(uint8_t brightness, bool state)
+// -----------------------------------------------------------------------------
+// Device-level state
+// -----------------------------------------------------------------------------
+namespace fc
 {
-  if (state)
-  {
-    analogWrite(LED_CONTROL_PIN, brightness * 255 / 100);
-  }
-  else
-  {
-    analogWrite(LED_CONTROL_PIN, 0);
-  }
-}
 
-static uint16_t crc16_ccitt(const uint8_t *buf, size_t len)
-{
-  uint16_t crc = 0xFFFF;
-  for (size_t i = 0; i < len; ++i)
+  struct DeviceState
   {
-    crc ^= (uint16_t)buf[i] << 8;
-    for (int b = 0; b < 8; ++b)
+    uint16_t brightness = 100;
+    bool ledOn = false;
+    uint32_t baseSeconds = 0;
+    uint64_t onStartedUs = 0;
+    uint8_t peerMac[6] = {0};
+    bool peerKnown = false;
+    uint8_t lastLogicalChannel = 0;
+    uint16_t lastSeq = 0;
+    bool stateDirty = false;
+    uint64_t lastPersistUs = 0;
+  };
+
+  struct PendingCommand
+  {
+    bool hasData = false;
+    MsgHdr header{};
+    CmdPayload payload{};
+    uint8_t mac[6] = {0};
+  };
+
+  static DeviceState state{};
+  static PendingCommand pending{};
+  static portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
+  static Preferences preferences;
+  static esp_now_peer_info_t peerInfo{};
+  static esp_pm_lock_handle_t pm_lock;
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+  static uint16_t crc16_ccitt(const uint8_t *buf, size_t len)
+  {
+    uint16_t crc = 0xFFFF;
+    for (size_t idx = 0; idx < len; ++idx)
     {
-      if (crc & 0x8000)
-        crc = (crc << 1) ^ 0x1021;
-      else
-        crc <<= 1;
+      crc ^= static_cast<uint16_t>(buf[idx]) << 8;
+      for (int bit = 0; bit < 8; ++bit)
+      {
+        crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021) : static_cast<uint16_t>(crc << 1);
+      }
     }
+    return crc;
   }
-  return crc;
-}
 
-void receiveMessage(const esp_now_recv_info *info, const uint8_t *data, int len)
-{
-  memcpy(senderMac, info->src_addr, 6);
-
-  if (len < (int)sizeof(MsgHdr))
-    return;
-  const MsgHdr *hdr = reinterpret_cast<const MsgHdr *>(data);
-  if (hdr->magic != 0xA5 || hdr->version != 0x01)
-    return;
-  if ((uint16_t)len != (uint16_t)(sizeof(MsgHdr) + hdr->len))
-    return;
-
-  // CRC check
-  MsgHdr tmp = *hdr;
-  tmp.crc = 0;
-  uint16_t crc = crc16_ccitt(reinterpret_cast<const uint8_t *>(&tmp), sizeof(MsgHdr));
-  uint16_t tail = crc16_ccitt(reinterpret_cast<const uint8_t *>(data) + sizeof(MsgHdr), hdr->len);
-  crc ^= tail;
-  if (crc != hdr->crc)
-    return;
-
-  const uint8_t *payload = reinterpret_cast<const uint8_t *>(data) + sizeof(MsgHdr);
-  if (hdr->type == MSG_CMD && hdr->len == sizeof(CmdPayload))
+  static uint64_t microsNow()
   {
-    // Apply brightness with PWM (0..100 -> duty)
-    const CmdPayload *cmd = reinterpret_cast<const CmdPayload *>(payload);
+    return static_cast<uint64_t>(esp_timer_get_time());
+  }
+
+  static uint32_t secondsSinceOn()
+  {
+    if (!state.ledOn || state.onStartedUs == 0)
+      return 0;
+    uint64_t now = microsNow();
+    if (now < state.onStartedUs)
+      return 0;
+    return static_cast<uint32_t>((now - state.onStartedUs) / 1000000ULL);
+  }
+
+  static uint32_t totalOperatingSeconds()
+  {
+    return state.baseSeconds + secondsSinceOn();
+  }
+
+  static void applyLedState()
+  {
+    uint32_t duty = state.ledOn ? static_cast<uint32_t>(state.brightness) * 255U / 100U : 0U;
+    analogWrite(LED_CONTROL_PIN, static_cast<int>(duty));
+    digitalWrite(LED_BUILTIN_PIN, state.ledOn ? HIGH : LOW);
+  }
+
+  static void markLedState(bool newState)
+  {
+    if (newState == state.ledOn)
+      return;
+
+    if (state.ledOn)
     {
-      // Clamp to 0..100 and remember
-      uint16_t bri = cmd->brightness;
-      if (bri > 100)
-        bri = 100;
-      currentBrightness = bri;
+      state.baseSeconds += secondsSinceOn();
+      state.onStartedUs = 0;
     }
 
-    // Handle LED state transitions to update operating time accumulator
-    bool newState = cmd->state ? true : false;
-    Serial.println("New state: " + String(newState) + ", brightness: " + String(currentBrightness));
-    currentState = newState;
-
-    updateLedState(currentBrightness, currentState);
-    updatePeerConnection();
-    saveStatus();
-
-    // Always ACK; send telemetry if requested
-    sendAck(hdr->seq, hdr->channel);
-    if (cmd->reqTelem)
-      sendTelemetry(hdr->channel, hdr->seq);
+    state.ledOn = newState;
+    state.onStartedUs = state.ledOn ? microsNow() : 0;
+    state.stateDirty = true;
   }
-}
 
-void initEspNow()
-{
-  WiFi.mode(WIFI_STA);
-  // Ensure ESPNOW uses the intended channel when not associated to an AP
-  esp_wifi_set_channel(MASTER_CHANNEL, WIFI_SECOND_CHAN_NONE);
-  if (esp_now_init() != ESP_OK)
+  static void updateBrightness(uint16_t brightness)
   {
-#ifdef DEBUG_MODE
-    Serial.println("ESP-NOW initialisation failed");
-#endif
-    ESP.restart();
+    if (brightness > 100)
+      brightness = 100;
+    if (brightness == state.brightness)
+      return;
+
+    state.brightness = brightness;
+    state.stateDirty = true;
   }
-  // deactivate pin hold from previous deep sleep
-  gpio_hold_dis(static_cast<gpio_num_t>(LED_CONTROL_PIN));
-  esp_now_register_recv_cb(receiveMessage);
-}
 
-void updatePeerConnection()
-{
-  if (memcmp(peerInfo.peer_addr, senderMac, 6) != 0)
+  static void ensurePeer(const uint8_t mac[6], uint8_t logicalChannel)
   {
-    esp_now_del_peer(peerInfo.peer_addr);
+    state.lastLogicalChannel = logicalChannel;
 
-    memcpy(peerInfo.peer_addr, senderMac, 6);
+    if (state.peerKnown && memcmp(state.peerMac, mac, 6) == 0)
+      return;
+
+    if (state.peerKnown)
+    {
+      esp_now_del_peer(state.peerMac);
+      state.peerKnown = false;
+    }
+
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, mac, 6);
+    peerInfo.ifidx = WIFI_IF_STA;
     peerInfo.channel = MASTER_CHANNEL;
     peerInfo.encrypt = false;
 
-    if (esp_now_add_peer(&peerInfo) != ESP_OK)
+    if (esp_now_add_peer(&peerInfo) == ESP_OK)
     {
-#ifdef DEBUG_MODE
-      Serial.println("Peer connection failed");
-#endif
+      memcpy(state.peerMac, mac, 6);
+      state.peerKnown = true;
     }
   }
-}
 
-void sendAck(uint16_t seq, uint8_t channel)
-{
-  MsgHdr hdr{};
-  hdr.magic = 0xA5;
-  hdr.version = 0x01;
-  hdr.type = MSG_ACK;
-  hdr.channel = channel;
-  hdr.len = 0;
-  hdr.seq = seq;
-  hdr.crc = 0;
-
-  uint16_t head = crc16_ccitt(reinterpret_cast<const uint8_t *>(&hdr), sizeof(MsgHdr));
-  uint16_t tail = crc16_ccitt(nullptr, 0); // == 0xFFFF by our impl
-  hdr.crc = head ^ tail;
-
-  esp_now_send(senderMac, reinterpret_cast<const uint8_t *>(&hdr), sizeof(MsgHdr));
-}
-
-void sendTelemetry(uint8_t channel, uint16_t seq)
-{
-  TelemetryPayload telem{};
-  telem.appliedBrightness = currentBrightness;
-  telem.appliedState = currentState ? 1 : 0;
-  telem.halfVoltageMv = (uint16_t)analogReadMilliVolts(BATTERY_PIN);
-  // Send total operating time in seconds (no division) for testing/precision
-  telem.operatingHours = 33 + getCurrentTotalSeconds(); // Later: / 3600U for hours
-  telem.lastChargedDate = 44;                           // TODO: set appropriately
-
-  MsgHdr hdr{};
-  hdr.magic = 0xA5;
-  hdr.version = 0x01;
-  hdr.type = MSG_TELEMETRY;
-  hdr.channel = channel;
-  hdr.len = sizeof(TelemetryPayload);
-  hdr.seq = seq; // tie telemetry to the last command
-  hdr.crc = 0;
-
-  uint8_t buffer[sizeof(MsgHdr) + sizeof(TelemetryPayload)];
-  memcpy(buffer, &hdr, sizeof(hdr));
-  memcpy(buffer + sizeof(hdr), &telem, sizeof(telem));
-  uint16_t head = crc16_ccitt(buffer, sizeof(MsgHdr));
-  uint16_t tail = crc16_ccitt(buffer + sizeof(MsgHdr), sizeof(TelemetryPayload));
-  reinterpret_cast<MsgHdr *>(buffer)->crc = head ^ tail;
-
-  esp_now_send(senderMac, buffer, sizeof(buffer));
-}
-
-void initHardware()
-{
-  pinMode(BATTERY_PIN, INPUT);
-  pinMode(LED_CONTROL_PIN, OUTPUT);
-  pinMode(LED_BUILTIN_PIN, OUTPUT);
-
-#ifdef DEBUG_MODE
-  Serial.begin(115200);
-#endif
-}
-
-void enterDeepSleep()
-{
-  saveStatus(); // Status vor dem Schlafen gehen speichern
-#ifdef DEBUG_MODE
-  Serial.println("Shutting down radio and entering deep sleep");
-#endif
-  esp_now_deinit();
-  WiFi.mode(WIFI_OFF);
-
-  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_TIMEOUT);
-
-  // If LED is off, turn off the pin to save power
-  // Dies ist für Deep Sleep nicht zwingend notwendig, da die meisten GPIOs ihren Zustand verlieren, schadet aber nicht.
-  digitalWrite(LED_CONTROL_PIN, LOW);
-  // gpio_hold_dis(static_cast<gpio_num_t>(LED_CONTROL_PIN));
-  esp_deep_sleep_start();
-}
-
-void enterLightSleep()
-{
-  saveStatus(); // Status vor dem Schlafen gehen speichern
-#ifdef DEBUG_MODE
-  Serial.println("Shutting down radio for light sleep...");
-#endif
-  // WLAN und ESP-NOW vor dem Light Sleep ordnungsgemäß herunterfahren
-  esp_now_deinit();
-  WiFi.mode(WIFI_OFF);
-
-  Serial.println("Entering light sleep");
-
-  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_TIMEOUT);
-  esp_err_t err = esp_light_sleep_start();
-#ifdef DEBUG_MODE
-  Serial.printf("Woke: err=%d, cause=%d\n", (int)err, (int)esp_sleep_get_wakeup_cause());
-#endif
-  // After light sleep resume WiFi/ESP-NOW for communication
-  resumeRadio();
-}
-
-void resumeRadio()
-{
-#ifdef DEBUG_MODE
-  Serial.println("Resuming radio (WiFi/ESP-NOW)");
-#endif
-  // initEspNow() kümmert sich um die Re-Initialisierung von WLAN und ESP-NOW
-  initEspNow();
-
-  // Re-add known peer on fixed channel if available
-  bool known = false;
-  for (int i = 0; i < 6; ++i)
+  static void persistState()
   {
-    if (senderMac[i] != 0)
+    uint32_t totalSeconds = totalOperatingSeconds();
+    preferences.begin("framecontrol", false);
+    preferences.putBool("led_status", state.ledOn);
+    preferences.putULong("op_sec", totalSeconds);
+    preferences.putUShort("brightness", state.brightness);
+    preferences.end();
+
+    state.baseSeconds = totalSeconds;
+    state.onStartedUs = state.ledOn ? microsNow() : 0;
+    state.stateDirty = false;
+    state.lastPersistUs = microsNow();
+  }
+
+  static void loadState()
+  {
+    preferences.begin("framecontrol", false);
+    state.ledOn = preferences.getBool("led_status", false);
+    state.baseSeconds = preferences.getULong("op_sec", 0);
+    state.brightness = preferences.getUShort("brightness", 100);
+    preferences.end();
+
+    state.onStartedUs = state.ledOn ? microsNow() : 0;
+    state.stateDirty = false;
+    state.lastPersistUs = microsNow();
+  }
+
+  static void sendAck(const uint8_t mac[6], uint16_t seq, uint8_t logicalChannel)
+  {
+    MsgHdr hdr{};
+    hdr.magic = 0xA5;
+    hdr.version = 0x01;
+    hdr.type = MSG_ACK;
+    hdr.channel = logicalChannel;
+    hdr.len = 0;
+    hdr.seq = seq;
+    hdr.crc = 0;
+
+    uint16_t head = crc16_ccitt(reinterpret_cast<const uint8_t *>(&hdr), sizeof(MsgHdr));
+    hdr.crc = head ^ crc16_ccitt(nullptr, 0);
+
+    esp_now_send(mac, reinterpret_cast<const uint8_t *>(&hdr), sizeof(MsgHdr));
+  }
+
+  static void sendTelemetry(const uint8_t mac[6], uint8_t logicalChannel, uint16_t seq)
+  {
+    TelemetryPayload telem{};
+    telem.appliedBrightness = state.brightness;
+    telem.appliedState = state.ledOn ? 1 : 0;
+    telem.halfVoltageMv = static_cast<uint16_t>(analogReadMilliVolts(BATTERY_PIN));
+    telem.operatingSeconds = totalOperatingSeconds();
+    telem.lastChargedDate = 0;
+
+    MsgHdr hdr{};
+    hdr.magic = 0xA5;
+    hdr.version = 0x01;
+    hdr.type = MSG_TELEMETRY;
+    hdr.channel = logicalChannel;
+    hdr.len = sizeof(TelemetryPayload);
+    hdr.seq = seq;
+    hdr.crc = 0;
+
+    uint8_t buffer[sizeof(MsgHdr) + sizeof(TelemetryPayload)];
+    memcpy(buffer, &hdr, sizeof(hdr));
+    memcpy(buffer + sizeof(hdr), &telem, sizeof(telem));
+
+    uint16_t head = crc16_ccitt(buffer, sizeof(MsgHdr));
+    uint16_t tail = crc16_ccitt(buffer + sizeof(MsgHdr), sizeof(TelemetryPayload));
+    reinterpret_cast<MsgHdr *>(buffer)->crc = head ^ tail;
+
+    esp_now_send(mac, buffer, sizeof(buffer));
+  }
+
+  static bool decodeCommand(const uint8_t *data, int len, MsgHdr &hdr, CmdPayload &cmd)
+  {
+    if (!data || len < static_cast<int>(sizeof(MsgHdr)))
+      return false;
+
+    memcpy(&hdr, data, sizeof(MsgHdr));
+    if (hdr.magic != 0xA5 || hdr.version != 0x01)
+      return false;
+    if (hdr.type != MSG_CMD || hdr.len != sizeof(CmdPayload))
+      return false;
+    if (len != static_cast<int>(sizeof(MsgHdr) + hdr.len))
+      return false;
+
+    MsgHdr tmp = hdr;
+    tmp.crc = 0;
+    uint16_t head = crc16_ccitt(reinterpret_cast<const uint8_t *>(&tmp), sizeof(MsgHdr));
+    uint16_t tail = crc16_ccitt(data + sizeof(MsgHdr), hdr.len);
+    if ((head ^ tail) != hdr.crc)
+      return false;
+
+    memcpy(&cmd, data + sizeof(MsgHdr), sizeof(CmdPayload));
+    return true;
+  }
+
+  static bool takePending(PendingCommand &out)
+  {
+    bool result = false;
+    portENTER_CRITICAL(&pendingMux);
+    if (pending.hasData)
     {
-      known = true;
-      break;
+      out = pending;
+      pending.hasData = false;
+      result = true;
+    }
+    portEXIT_CRITICAL(&pendingMux);
+    return result;
+  }
+
+  static void handleCommand(const PendingCommand &cmd)
+  {
+    ensurePeer(cmd.mac, cmd.header.channel);
+    state.lastSeq = cmd.header.seq;
+
+    updateBrightness(cmd.payload.brightness);
+    markLedState(cmd.payload.state != 0);
+    applyLedState();
+
+    if (state.stateDirty)
+    {
+      persistState();
+    }
+
+    sendAck(cmd.mac, cmd.header.seq, cmd.header.channel);
+    if (cmd.payload.reqTelem)
+    {
+      sendTelemetry(cmd.mac, cmd.header.channel, cmd.header.seq);
     }
   }
-  if (known)
+
+  static void processPendingCommands()
   {
-    memcpy(peerInfo.peer_addr, senderMac, 6);
-    peerInfo.channel = MASTER_CHANNEL;
-    peerInfo.encrypt = false;
-    if (esp_now_add_peer(&peerInfo) != ESP_OK)
+    PendingCommand cmd;
+    while (takePending(cmd))
     {
-#ifdef DEBUG_MODE
-      Serial.println("Failed to re-add peer");
-#endif
+      handleCommand(cmd);
     }
   }
-}
 
-void printMacAddress()
-{
-  // Variable to store the MAC address
-  uint8_t baseMac[6];
-
-  // Get MAC address of the WiFi station interface
-  esp_read_mac(baseMac, ESP_MAC_WIFI_STA);
-  Serial.print("Station MAC: ");
-  for (int i = 0; i < 5; i++)
+  static void maybePersistRuntime()
   {
-    Serial.printf("%02X:", baseMac[i]);
+    if (!state.ledOn)
+      return;
+
+    uint64_t now = microsNow();
+    if (now - state.lastPersistUs >= STATE_PERSIST_INTERVAL_US)
+    {
+      persistState();
+    }
   }
-  Serial.printf("%02X\n", baseMac[5]);
-}
 
-void saveStatus()
-{
-  preferences.begin("framecontrol", false);
-  preferences.putBool("led_status", currentState);
-  uint32_t nowMs = millis();
-  uint32_t seconds = baseTotalSeconds + ((currentState && onStartMs != 0) ? ((nowMs - onStartMs) / 1000U) : 0U);
-  preferences.putULong("op_sec", seconds);
-  preferences.putUShort("brightness", currentBrightness);
-  preferences.end();
-}
+  static void sendHeartbeat()
+  {
+    if (!state.peerKnown)
+      return;
 
-void loadStatus()
-{
-  preferences.begin("framecontrol", false);
-  currentState = preferences.getBool("led_status", false);
-  baseTotalSeconds = preferences.getULong("op_sec", 0);
-  currentBrightness = preferences.getUShort("brightness", 100);
-  preferences.end();
-  sessionStartMs = millis();
-  onStartMs = currentState ? millis() : 0;
-}
+    // if (++telemetrySeq == 0)
+    // {
+    //   ++telemetrySeq;
+    // }
 
-// Compute total seconds = persisted base + this session elapsed
-static uint32_t getCurrentTotalSeconds()
-{
-  uint32_t nowMs = millis();
-  uint32_t onDelta = (currentState && onStartMs != 0) ? ((nowMs - onStartMs) / 1000U) : 0U;
-  return baseTotalSeconds + onDelta;
-}
+    sendTelemetry(state.peerMac, state.lastLogicalChannel, 123);
+  }
 
+  static void initHardware()
+  {
+    pinMode(BATTERY_PIN, INPUT);
+    pinMode(LED_CONTROL_PIN, OUTPUT);
+    pinMode(LED_BUILTIN_PIN, OUTPUT);
+  }
+
+  static void onEspNowReceive(const esp_now_recv_info *info, const uint8_t *data, int len)
+  {
+    if (!info)
+      return;
+
+    MsgHdr hdr;
+    CmdPayload cmd;
+    if (!decodeCommand(data, len, hdr, cmd))
+      return;
+
+    portENTER_CRITICAL(&pendingMux);
+    pending.header = hdr;
+    pending.payload = cmd;
+    memcpy(pending.mac, info->src_addr, 6);
+    pending.hasData = true;
+    portEXIT_CRITICAL(&pendingMux);
+  }
+
+  static void initRadio()
+  {
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    esp_wifi_set_channel(MASTER_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+    if (esp_now_init() != ESP_OK)
+    {
+      ESP.restart();
+    }
+
+    esp_now_register_recv_cb(onEspNowReceive);
+  }
+
+  static void enterDeepSleep()
+  {
+    persistState();
+    esp_now_deinit();
+    WiFi.mode(WIFI_OFF);
+    esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
+    digitalWrite(LED_CONTROL_PIN, LOW);
+    esp_deep_sleep_start();
+  }
+
+  static void activeWindow()
+  {
+    esp_pm_lock_acquire(pm_lock);
+    uint32_t windowStart = millis();
+
+    processPendingCommands();
+    maybePersistRuntime();
+    sendHeartbeat();
+
+    while ((millis() - windowStart) < ACTIVE_WINDOW_MS)
+    {
+      delay(20);
+      processPendingCommands();
+    }
+    esp_pm_lock_release(pm_lock);
+  }
+
+} // namespace fc
+
+// -----------------------------------------------------------------------------
+// Arduino entry points
+// -----------------------------------------------------------------------------
 void setup()
 {
-  initHardware();
-  initEspNow();
+  fc::initHardware();
+  fc::loadState();
+  fc::applyLedState();
+  fc::initRadio();
 
-  loadStatus();                                    // Load the status on startup
-  updateLedState(currentBrightness, currentState); // Update the LED state based on the loaded status
-
-#ifdef DEBUG_MODE
-  printMacAddress(); // Read the MAC address of the ESP32
-  Serial.println("Receiver ready");
-  // stay awake for 10 sec -> for debugging
-  delay(5000);
+#if CONFIG_PM_ENABLE
+  esp_pm_config_t pm_config = {
+      .max_freq_mhz = 80, .min_freq_mhz = 40, .light_sleep_enable = true};
+  esp_pm_configure(&pm_config);
+  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "active", &fc::pm_lock);
 #endif
 }
 
 void loop()
 {
-  if (currentState)
+  fc::activeWindow();
+  if (!fc::state.ledOn)
   {
-    // Stay awake briefly to receive commands, then sleep
-    loadStatus();
-    updateLedState(currentBrightness, currentState);
-    receiveMessage(nullptr, nullptr, 0); // Dummy call to allow processing incoming messages
-    delay(WAKE_UP_TIME);                 // Kurz wach bleiben, um Befehle zu empfangen
-    enterLightSleep();
-    // Nach Wake wird ggf. receiveMessage() aufgerufen und currentState/Helligkeit angepasst
+    fc::enterDeepSleep();
   }
-  else
-  {
-    enterDeepSleep(); // LED aus -> echter Deep‑Sleep
-  }
+  delay(SLEEP_INTERVAL_US / 1000ULL); // Allow time for automatic light sleep
 }
