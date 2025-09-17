@@ -14,14 +14,14 @@
 // -----------------------------------------------------------------------------
 constexpr uint8_t BATTERY_PIN = 0;
 constexpr uint8_t LED_CONTROL_PIN = 22;
-constexpr uint8_t LED_BUILTIN_PIN = 10;
-constexpr uint32_t ACTIVE_WINDOW_MS = 1000;                               // awake time per burst
+constexpr uint8_t LED_BUILTIN_PIN = 15;
+constexpr uint32_t ACTIVE_WINDOW_MS = 5000;                               // awake time per burst
 constexpr uint64_t SLEEP_INTERVAL_US = 5ULL * 1000000ULL;                 // 60 seconds
 constexpr uint64_t STATE_PERSIST_INTERVAL_US = 5ULL * 60ULL * 1000000ULL; // 5 minutes
 
-#ifndef MASTER_CHANNEL
-#define MASTER_CHANNEL 0
-#endif
+// 1C:69:20:CE:68:50 Master-Info
+static const uint8_t MASTER_MAC[6] = {0x1C, 0x69, 0x20, 0xCE, 0x68, 0x50};
+static const uint8_t MASTER_CHANNEL = 1;
 
 // -----------------------------------------------------------------------------
 // Protocol primitives
@@ -166,6 +166,16 @@ namespace fc
 
     state.brightness = brightness;
     state.stateDirty = true;
+  }
+
+  static void addMasterPeer()
+  {
+    esp_now_peer_info_t peer{};
+    memcpy(peer.peer_addr, MASTER_MAC, 6);
+    peer.channel = MASTER_CHANNEL;
+    peer.encrypt = false;
+    peer.ifidx = WIFI_IF_STA;
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
   }
 
   static void ensurePeer(const uint8_t mac[6], uint8_t logicalChannel)
@@ -389,7 +399,7 @@ namespace fc
   static void initRadio()
   {
     WiFi.mode(WIFI_STA);
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    esp_wifi_set_ps(WIFI_PS_NONE);
     esp_wifi_set_channel(MASTER_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
     if (esp_now_init() != ESP_OK)
@@ -400,31 +410,63 @@ namespace fc
     esp_now_register_recv_cb(onEspNowReceive);
   }
 
+  static void initRadioAfterWake()
+  {
+    WiFi.mode(WIFI_STA);
+    esp_wifi_start();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    wifi_country_t c = {.cc = "EU", .schan = 1, .nchan = 13, .policy = WIFI_COUNTRY_POLICY_MANUAL};
+    esp_wifi_set_country(&c);
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(MASTER_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+
+    ESP_ERROR_CHECK(esp_now_init());
+    addMasterPeer();
+    esp_now_register_recv_cb(onEspNowReceive);
+
+    vTaskDelay(pdMS_TO_TICKS(50)); // 50 ms RF settle
+  }
+
+  static void suspendRadioBeforeSleep()
+  {
+    esp_now_deinit();
+    esp_wifi_stop();
+  }
+
   static void enterDeepSleep()
   {
     persistState();
     esp_now_deinit();
     WiFi.mode(WIFI_OFF);
     esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
-    digitalWrite(LED_CONTROL_PIN, LOW);
+    // digitalWrite(LED_CONTROL_PIN, LOW);
     esp_deep_sleep_start();
+  }
+
+  static void enterLightSleep()
+  {
+    suspendRadioBeforeSleep();
+
+    // esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
+    // esp_light_sleep_start();
+
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US));
+    esp_err_t err = esp_light_sleep_start();
+    ESP_ERROR_CHECK(err);
+
+    ESP_ERROR_CHECK(esp_sleep_get_wakeup_cause());
+
+    initRadioAfterWake();
   }
 
   static void activeWindow()
   {
-    esp_pm_lock_acquire(pm_lock);
-    uint32_t windowStart = millis();
-
     processPendingCommands();
     maybePersistRuntime();
     sendHeartbeat();
-
-    while ((millis() - windowStart) < ACTIVE_WINDOW_MS)
-    {
-      delay(20);
-      processPendingCommands();
-    }
-    esp_pm_lock_release(pm_lock);
   }
 
 } // namespace fc
@@ -432,27 +474,51 @@ namespace fc
 // -----------------------------------------------------------------------------
 // Arduino entry points
 // -----------------------------------------------------------------------------
+
+void blink(int times, int delayMs)
+{
+  for (int i = 0; i < times; ++i)
+  {
+    digitalWrite(LED_BUILTIN_PIN, HIGH);
+    delay(delayMs);
+    digitalWrite(LED_BUILTIN_PIN, LOW);
+    delay(delayMs);
+  }
+}
+
 void setup()
 {
   fc::initHardware();
   fc::loadState();
   fc::applyLedState();
-  fc::initRadio();
+  fc::initRadioAfterWake();
 
-#if CONFIG_PM_ENABLE
-  esp_pm_config_t pm_config = {
-      .max_freq_mhz = 80, .min_freq_mhz = 40, .light_sleep_enable = true};
-  esp_pm_configure(&pm_config);
-  esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "active", &fc::pm_lock);
-#endif
+  Serial.begin(115200);
 }
 
 void loop()
 {
-  fc::activeWindow();
+  blink(2, 300); // just for debugging - delete later
+
+  // Now we have a window to receive commands for ACTIVE_WINDOW_MS.
+  uint64_t start = fc::microsNow();
+  while (fc::microsNow() - start < (ACTIVE_WINDOW_MS * 1000ULL))
+  {
+    fc::processPendingCommands();
+    delay(20); // Small delay to prevent busy-waiting
+  }
+
+  // After the window, send a heartbeat and persist state if needed.
+  fc::sendHeartbeat();
+  fc::maybePersistRuntime();
+
+  // Now go back to sleep.
   if (!fc::state.ledOn)
   {
     fc::enterDeepSleep();
   }
-  delay(SLEEP_INTERVAL_US / 1000ULL); // Allow time for automatic light sleep
+  else
+  {
+    fc::enterLightSleep();
+  }
 }
