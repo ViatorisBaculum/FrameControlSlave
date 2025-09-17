@@ -138,16 +138,32 @@ namespace fc
 
   // LEDC configuration for PWM control
   constexpr int LEDC_TIMER_BIT = 8;
-  constexpr int LEDC_BASE_FREQ = 5000;
+  constexpr int LEDC_BASE_FREQ = 1000; // Lowered for LP clock
   constexpr ledc_channel_t LEDC_CHANNEL = LEDC_CHANNEL_0;
   constexpr ledc_mode_t LEDC_SPEED_MODE = LEDC_LOW_SPEED_MODE;
   constexpr ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
 
   static void applyLedState()
   {
-    uint32_t duty = state.ledOn ? static_cast<uint32_t>(state.brightness) * ((1 << LEDC_TIMER_BIT) - 1) / 100U : 0U;
-    ledc_set_duty(LEDC_SPEED_MODE, LEDC_CHANNEL, duty);
-    ledc_update_duty(LEDC_SPEED_MODE, LEDC_CHANNEL);
+    const bool pwm = state.ledOn && state.brightness > 0 && state.brightness < 100;
+
+    if (pwm)
+    {
+      gpio_hold_dis((gpio_num_t)LED_CONTROL_PIN);
+      ledc_set_duty(LEDC_SPEED_MODE, LEDC_CHANNEL,
+                    state.brightness * ((1 << LEDC_TIMER_BIT) - 1) / 100U);
+      ledc_update_duty(LEDC_SPEED_MODE, LEDC_CHANNEL);
+    }
+    else
+    {
+      const bool driveHigh = state.ledOn && state.brightness >= 100;
+
+      gpio_hold_dis((gpio_num_t)LED_CONTROL_PIN);
+      ledc_stop(LEDC_SPEED_MODE, LEDC_CHANNEL, driveHigh ? 1 : 0);
+      digitalWrite(LED_CONTROL_PIN, driveHigh ? HIGH : LOW);
+      gpio_hold_en((gpio_num_t)LED_CONTROL_PIN);
+    }
+
     digitalWrite(LED_BUILTIN_PIN, state.ledOn ? HIGH : LOW);
   }
 
@@ -431,20 +447,6 @@ namespace fc
     portEXIT_CRITICAL(&pendingMux);
   }
 
-  static void initRadio()
-  {
-    WiFi.mode(WIFI_STA);
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    esp_wifi_set_channel(MASTER_CHANNEL, WIFI_SECOND_CHAN_NONE);
-
-    if (esp_now_init() != ESP_OK)
-    {
-      ESP.restart();
-    }
-
-    esp_now_register_recv_cb(onEspNowReceive);
-  }
-
   static void initRadioAfterWake()
   {
     WiFi.mode(WIFI_STA);
@@ -477,17 +479,12 @@ namespace fc
     esp_now_deinit();
     WiFi.mode(WIFI_OFF);
     esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
-    // digitalWrite(LED_CONTROL_PIN, LOW);
     esp_deep_sleep_start();
   }
 
   static void enterLightSleep()
   {
     suspendRadioBeforeSleep();
-
-    // Keep specific power domains active during light sleep.
-    // ESP_PD_DOMAIN_XTAL is needed to keep the LEDC clock running.
-    esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL, ESP_PD_OPTION_ON);
 
     ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US));
     esp_err_t err = esp_light_sleep_start();
@@ -529,9 +526,8 @@ void setup()
 {
   fc::initHardware();
   fc::loadState();
-  fc::applyLedState();
   fc::initRadioAfterWake();
-
+  fc::applyLedState();
   Serial.begin(115200);
 }
 
@@ -552,7 +548,7 @@ void loop()
   fc::maybePersistRuntime();
 
   // Now go back to sleep.
-  if (!fc::state.ledOn)
+  if (!fc::state.ledOn || fc::state.brightness == 0 || fc::state.brightness == 100)
   {
     fc::enterDeepSleep();
   }
