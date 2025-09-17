@@ -8,6 +8,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
 #include <esp_pm.h>
+#include <driver/ledc.h>
+#include <esp_sleep.h>
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -134,10 +136,18 @@ namespace fc
     return state.baseSeconds + secondsSinceOn();
   }
 
+  // LEDC configuration for PWM control
+  constexpr int LEDC_TIMER_BIT = 8;
+  constexpr int LEDC_BASE_FREQ = 5000;
+  constexpr ledc_channel_t LEDC_CHANNEL = LEDC_CHANNEL_0;
+  constexpr ledc_mode_t LEDC_SPEED_MODE = LEDC_LOW_SPEED_MODE;
+  constexpr ledc_timer_t LEDC_TIMER = LEDC_TIMER_0;
+
   static void applyLedState()
   {
-    uint32_t duty = state.ledOn ? static_cast<uint32_t>(state.brightness) * 255U / 100U : 0U;
-    analogWrite(LED_CONTROL_PIN, static_cast<int>(duty));
+    uint32_t duty = state.ledOn ? static_cast<uint32_t>(state.brightness) * ((1 << LEDC_TIMER_BIT) - 1) / 100U : 0U;
+    ledc_set_duty(LEDC_SPEED_MODE, LEDC_CHANNEL, duty);
+    ledc_update_duty(LEDC_SPEED_MODE, LEDC_CHANNEL);
     digitalWrite(LED_BUILTIN_PIN, state.ledOn ? HIGH : LOW);
   }
 
@@ -371,11 +381,36 @@ namespace fc
     sendTelemetry(state.peerMac, state.lastLogicalChannel, 123);
   }
 
+  static void initLedPwm()
+  {
+    // Configure LEDC timer
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode = LEDC_SPEED_MODE,
+        .duty_resolution = (ledc_timer_bit_t)LEDC_TIMER_BIT,
+        .timer_num = LEDC_TIMER,
+        .freq_hz = LEDC_BASE_FREQ,
+        .clk_cfg = LEDC_USE_RC_FAST_CLK};
+    ESP_ERROR_CHECK(ledc_timer_config(&ledc_timer));
+
+    // Configure LEDC channel
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num = LED_CONTROL_PIN,
+        .speed_mode = LEDC_SPEED_MODE,
+        .channel = LEDC_CHANNEL,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER,
+        .duty = 0,
+        .sleep_mode = LEDC_SLEEP_MODE_KEEP_ALIVE,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
+    ESP_ERROR_CHECK(gpio_sleep_sel_dis((gpio_num_t)LED_CONTROL_PIN));
+  }
+
   static void initHardware()
   {
     pinMode(BATTERY_PIN, INPUT);
-    pinMode(LED_CONTROL_PIN, OUTPUT);
     pinMode(LED_BUILTIN_PIN, OUTPUT);
+    initLedPwm();
   }
 
   static void onEspNowReceive(const esp_now_recv_info *info, const uint8_t *data, int len)
@@ -450,12 +485,16 @@ namespace fc
   {
     suspendRadioBeforeSleep();
 
-    // esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
-    // esp_light_sleep_start();
+    // Keep specific power domains active during light sleep.
+    // ESP_PD_DOMAIN_XTAL is needed to keep the LEDC clock running.
+    esp_sleep_pd_config(ESP_PD_DOMAIN_XTAL, ESP_PD_OPTION_ON);
 
     ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US));
     esp_err_t err = esp_light_sleep_start();
-    ESP_ERROR_CHECK(err);
+    if (err != ESP_OK && err != ESP_ERR_SLEEP_REJECT)
+    {
+      ESP_ERROR_CHECK(err);
+    }
 
     ESP_ERROR_CHECK(esp_sleep_get_wakeup_cause());
 
