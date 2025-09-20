@@ -20,6 +20,7 @@ constexpr uint8_t LED_BUILTIN_PIN = 15;
 constexpr uint32_t ACTIVE_WINDOW_MS = 5000;                               // awake time per burst
 constexpr uint64_t SLEEP_INTERVAL_US = 5ULL * 1000000ULL;                 // 60 seconds
 constexpr uint64_t STATE_PERSIST_INTERVAL_US = 5ULL * 60ULL * 1000000ULL; // 5 minutes
+constexpr uint16_t BATTERY_CHARGED_THRESHOLD_MV = 2080;
 
 // 1C:69:20:CE:68:50 Master-Info
 static const uint8_t MASTER_MAC[6] = {0x1C, 0x69, 0x20, 0xCE, 0x68, 0x50};
@@ -76,6 +77,9 @@ namespace fc
     bool ledOn = false;
     uint32_t baseSeconds = 0;
     uint64_t onStartedUs = 0;
+    uint32_t lastChargedSeconds = 0;
+    uint64_t lastChargeStartedUs = 0;
+    uint16_t lastBatteryMv = 0;
     uint8_t peerMac[6] = {0};
     bool peerKnown = false;
     uint8_t lastLogicalChannel = 0;
@@ -134,6 +138,40 @@ namespace fc
   static uint32_t totalOperatingSeconds()
   {
     return state.baseSeconds + secondsSinceOn();
+  }
+
+  static uint32_t secondsSinceLastCharge()
+  {
+    uint64_t now = microsNow();
+    if (state.lastChargeStartedUs == 0 || now < state.lastChargeStartedUs)
+    {
+      return state.lastChargedSeconds;
+    }
+    return state.lastChargedSeconds + static_cast<uint32_t>((now - state.lastChargeStartedUs) / 1000000ULL);
+  }
+
+  static void updateChargeTimer(uint16_t voltageMv)
+  {
+    uint64_t now = microsNow();
+    if (state.lastChargeStartedUs == 0)
+    {
+      state.lastChargeStartedUs = now;
+    }
+
+    state.lastBatteryMv = voltageMv;
+
+    if (voltageMv > BATTERY_CHARGED_THRESHOLD_MV)
+    {
+      state.lastChargedSeconds = 0;
+      state.lastChargeStartedUs = now;
+    }
+  }
+
+  static uint16_t sampleBatteryMv()
+  {
+    uint16_t mv = static_cast<uint16_t>(analogReadMilliVolts(BATTERY_PIN));
+    updateChargeTimer(mv);
+    return mv;
   }
 
   // LEDC configuration for PWM control
@@ -233,16 +271,22 @@ namespace fc
   static void saveState()
   {
     uint32_t totalSeconds = totalOperatingSeconds();
+    uint32_t sinceLastCharge = secondsSinceLastCharge();
+
     preferences.begin("framecontrol", false);
     preferences.putBool("led_status", state.ledOn);
     preferences.putULong("op_sec", totalSeconds);
     preferences.putUShort("brightness", state.brightness);
+    preferences.putULong("last_charge", sinceLastCharge);
     preferences.end();
 
+    uint64_t now = microsNow();
     state.baseSeconds = totalSeconds;
-    state.onStartedUs = state.ledOn ? microsNow() : 0;
+    state.onStartedUs = state.ledOn ? now : 0;
+    state.lastChargedSeconds = sinceLastCharge;
+    state.lastChargeStartedUs = now;
     state.stateDirty = false;
-    state.lastPersistUs = microsNow();
+    state.lastPersistUs = now;
   }
 
   static void loadState()
@@ -251,11 +295,14 @@ namespace fc
     state.ledOn = preferences.getBool("led_status", false);
     state.baseSeconds = preferences.getULong("op_sec", 0);
     state.brightness = preferences.getUShort("brightness", 100);
+    state.lastChargedSeconds = preferences.getULong("last_charge", 0);
     preferences.end();
 
-    state.onStartedUs = state.ledOn ? microsNow() : 0;
+    uint64_t now = microsNow();
+    state.onStartedUs = state.ledOn ? now : 0;
+    state.lastChargeStartedUs = now;
     state.stateDirty = false;
-    state.lastPersistUs = microsNow();
+    state.lastPersistUs = now;
   }
 
   static void sendAck(const uint8_t mac[6], uint16_t seq, uint8_t logicalChannel)
@@ -278,11 +325,12 @@ namespace fc
   static void sendTelemetry(const uint8_t mac[6], uint8_t logicalChannel, uint16_t seq)
   {
     TelemetryPayload telem{};
+    uint16_t batteryMv = sampleBatteryMv();
     telem.appliedBrightness = state.brightness;
     telem.appliedState = state.ledOn ? 1 : 0;
-    telem.halfVoltageMv = static_cast<uint16_t>(analogReadMilliVolts(BATTERY_PIN));
+    telem.halfVoltageMv = batteryMv;
     telem.operatingSeconds = totalOperatingSeconds();
-    telem.lastChargedDate = 0;
+    telem.lastChargedDate = secondsSinceLastCharge();
 
     MsgHdr hdr{};
     hdr.magic = 0xA5;
@@ -504,6 +552,8 @@ namespace fc
       state.baseSeconds += SLEEP_INTERVAL_US / 1000000ULL;
     }
 
+    state.lastChargedSeconds += SLEEP_INTERVAL_US / 1000000ULL;
+
     saveState();
 
     if (!state.ledOn || state.brightness == 0 || state.brightness == 100)
@@ -562,6 +612,7 @@ void loop()
   }
 
   // After the window, send a heartbeat and persist state if needed.
+  fc::sampleBatteryMv();
   fc::sendHeartbeat();
   fc::maybePersistRuntime();
 
