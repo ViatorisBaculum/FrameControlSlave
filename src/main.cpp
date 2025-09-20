@@ -230,7 +230,7 @@ namespace fc
     }
   }
 
-  static void persistState()
+  static void saveState()
   {
     uint32_t totalSeconds = totalOperatingSeconds();
     preferences.begin("framecontrol", false);
@@ -353,7 +353,7 @@ namespace fc
 
     if (state.stateDirty)
     {
-      persistState();
+      saveState();
     }
 
     sendAck(cmd.mac, cmd.header.seq, cmd.header.channel);
@@ -380,7 +380,7 @@ namespace fc
     uint64_t now = microsNow();
     if (now - state.lastPersistUs >= STATE_PERSIST_INTERVAL_US)
     {
-      persistState();
+      saveState();
     }
   }
 
@@ -475,7 +475,6 @@ namespace fc
 
   static void enterDeepSleep()
   {
-    persistState();
     esp_now_deinit();
     WiFi.mode(WIFI_OFF);
     esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
@@ -496,6 +495,25 @@ namespace fc
     ESP_ERROR_CHECK(esp_sleep_get_wakeup_cause());
 
     initRadioAfterWake();
+  }
+
+  static void enterSleep()
+  {
+    if (state.ledOn)
+    {
+      state.baseSeconds += SLEEP_INTERVAL_US / 1000000ULL;
+    }
+
+    saveState();
+
+    if (!state.ledOn || state.brightness == 0 || state.brightness == 100)
+    {
+      enterDeepSleep();
+    }
+    else
+    {
+      enterLightSleep();
+    }
   }
 
   static void activeWindow()
@@ -548,12 +566,5 @@ void loop()
   fc::maybePersistRuntime();
 
   // Now go back to sleep.
-  if (!fc::state.ledOn || fc::state.brightness == 0 || fc::state.brightness == 100)
-  {
-    fc::enterDeepSleep();
-  }
-  else
-  {
-    fc::enterLightSleep();
-  }
+  fc::enterSleep();
 }
