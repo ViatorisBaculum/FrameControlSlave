@@ -10,6 +10,7 @@
 #include <esp_pm.h>
 #include <driver/ledc.h>
 #include <esp_sleep.h>
+#include <esp_system.h>
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -83,7 +84,6 @@ namespace fc
     uint8_t peerMac[6] = {0};
     bool peerKnown = false;
     uint8_t lastLogicalChannel = 0;
-    uint16_t lastSeq = 0;
     bool stateDirty = false;
     uint64_t lastPersistUs = 0;
   };
@@ -102,6 +102,11 @@ namespace fc
   static Preferences preferences;
   static esp_now_peer_info_t peerInfo{};
   static esp_pm_lock_handle_t pm_lock;
+
+  static volatile bool awaitingTelemetryAck = false;
+  static volatile bool telemetryAcked = false;
+  static volatile uint16_t pendingTelemetrySeq = 0;
+  static volatile uint64_t telemetrySentUs = 0;
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -322,7 +327,7 @@ namespace fc
     esp_now_send(mac, reinterpret_cast<const uint8_t *>(&hdr), sizeof(MsgHdr));
   }
 
-  static void sendTelemetry(const uint8_t mac[6], uint8_t logicalChannel, uint16_t seq)
+  static void sendTelemetry(const uint8_t mac[6], uint8_t logicalChannel, bool trackAck)
   {
     TelemetryPayload telem{};
     uint16_t batteryMv = sampleBatteryMv();
@@ -331,6 +336,20 @@ namespace fc
     telem.halfVoltageMv = batteryMv;
     telem.operatingSeconds = totalOperatingSeconds();
     telem.lastChargedDate = secondsSinceLastCharge();
+
+    uint16_t seq = static_cast<uint16_t>(esp_random() & 0xFFFF);
+    if (seq == 0)
+    {
+      seq = 1;
+    }
+
+    if (trackAck)
+    {
+      pendingTelemetrySeq = seq;
+      awaitingTelemetryAck = true;
+      telemetryAcked = false;
+      telemetrySentUs = microsNow();
+    }
 
     MsgHdr hdr{};
     hdr.magic = 0xA5;
@@ -393,7 +412,6 @@ namespace fc
   static void handleCommand(const PendingCommand &cmd)
   {
     ensurePeer(cmd.mac, cmd.header.channel);
-    state.lastSeq = cmd.header.seq;
 
     updateBrightness(cmd.payload.brightness);
     markLedState(cmd.payload.state != 0);
@@ -407,7 +425,7 @@ namespace fc
     sendAck(cmd.mac, cmd.header.seq, cmd.header.channel);
     if (cmd.payload.reqTelem)
     {
-      sendTelemetry(cmd.mac, cmd.header.channel, cmd.header.seq);
+      sendTelemetry(cmd.mac, cmd.header.channel, true);
     }
   }
 
@@ -442,7 +460,7 @@ namespace fc
     //   ++telemetrySeq;
     // }
 
-    sendTelemetry(state.peerMac, state.lastLogicalChannel, 123);
+    sendTelemetry(state.peerMac, state.lastLogicalChannel, false);
   }
 
   static void initLedPwm()
@@ -479,11 +497,31 @@ namespace fc
 
   static void onEspNowReceive(const esp_now_recv_info *info, const uint8_t *data, int len)
   {
-    if (!info)
+    if (!info || !data || len < static_cast<int>(sizeof(MsgHdr)))
       return;
 
-    MsgHdr hdr;
-    CmdPayload cmd;
+    MsgHdr hdr{};
+    memcpy(&hdr, data, sizeof(MsgHdr));
+    if (hdr.magic != 0xA5 || hdr.version != 0x01)
+      return;
+
+    if (hdr.type == MSG_ACK)
+    {
+      if (awaitingTelemetryAck && hdr.seq == pendingTelemetrySeq &&
+          (!state.peerKnown || memcmp(info->src_addr, state.peerMac, 6) == 0))
+      {
+        telemetryAcked = true;
+        awaitingTelemetryAck = false;
+        pendingTelemetrySeq = 0;
+        Serial.printf("telemetry acked seq=%u\n", hdr.seq);
+      }
+      return;
+    }
+
+    if (hdr.type != MSG_CMD)
+      return;
+
+    CmdPayload cmd{};
     if (!decodeCommand(data, len, hdr, cmd))
       return;
 
@@ -603,17 +641,45 @@ void loop()
 {
   blink(2, 300); // just for debugging - delete later
 
-  // Now we have a window to receive commands for ACTIVE_WINDOW_MS.
+  // Reset handshake tracking at the start of each wake window.
+  fc::awaitingTelemetryAck = false;
+  fc::telemetryAcked = false;
+  fc::pendingTelemetrySeq = 0;
+  fc::telemetrySentUs = 0;
+
+  // Window to receive commands and wait for handshake completion.
   uint64_t start = fc::microsNow();
+  bool ackTimeoutLogged = false;
   while (fc::microsNow() - start < (ACTIVE_WINDOW_MS * 1000ULL))
   {
+    if (fc::telemetryAcked)
+    {
+      Serial.println("telemetry handshake complete - sleeping early");
+      break;
+    }
+
     fc::processPendingCommands();
+
+    if (fc::awaitingTelemetryAck && !ackTimeoutLogged)
+    {
+      uint64_t elapsedUs = fc::microsNow() - fc::telemetrySentUs;
+      if (elapsedUs > 200000ULL)
+      {
+        Serial.println("WARN: telemetry ACK timeout");
+        ackTimeoutLogged = true;
+      }
+    }
+
     delay(20); // Small delay to prevent busy-waiting
   }
 
-  // After the window, send a heartbeat and persist state if needed.
-  fc::sampleBatteryMv();
-  fc::sendHeartbeat();
+  const bool shouldSendHeartbeat = !fc::telemetryAcked;
+  if (shouldSendHeartbeat)
+  {
+    fc::sampleBatteryMv();
+    fc::sendHeartbeat();
+  }
+
   fc::maybePersistRuntime();
 
   // Now go back to sleep.
