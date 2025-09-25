@@ -53,6 +53,7 @@ struct CmdPayload
 {
   uint16_t brightness;
   uint8_t state;
+  uint8_t automatic;
   uint8_t reqTelem;
 };
 
@@ -60,6 +61,7 @@ struct TelemetryPayload
 {
   uint16_t appliedBrightness;
   uint8_t appliedState;
+  uint8_t appliedAutomatic;
   uint16_t halfVoltageMv;
   uint32_t operatingSeconds;
   uint32_t lastChargedDate;
@@ -76,6 +78,7 @@ namespace fc
   {
     uint16_t brightness = 100;
     bool ledOn = false;
+    bool automaticMode = false;
     uint32_t baseSeconds = 0;
     uint64_t onStartedUs = 0;
     uint32_t lastChargedSeconds = 0;
@@ -168,6 +171,7 @@ namespace fc
     if (voltageMv > BATTERY_CHARGED_THRESHOLD_MV)
     {
       state.lastChargedSeconds = 0;
+      state.baseSeconds = 0; // reset total operating time on charge
       state.lastChargeStartedUs = now;
     }
   }
@@ -280,6 +284,7 @@ namespace fc
 
     preferences.begin("framecontrol", false);
     preferences.putBool("led_status", state.ledOn);
+    preferences.putBool("automatic", state.automaticMode);
     preferences.putULong("op_sec", totalSeconds);
     preferences.putUShort("brightness", state.brightness);
     preferences.putULong("last_charge", sinceLastCharge);
@@ -298,6 +303,7 @@ namespace fc
   {
     preferences.begin("framecontrol", false);
     state.ledOn = preferences.getBool("led_status", false);
+    state.automaticMode = preferences.getBool("automatic", false);
     state.baseSeconds = preferences.getULong("op_sec", 0);
     state.brightness = preferences.getUShort("brightness", 100);
     state.lastChargedSeconds = preferences.getULong("last_charge", 0);
@@ -333,6 +339,7 @@ namespace fc
     uint16_t batteryMv = sampleBatteryMv();
     telem.appliedBrightness = state.brightness;
     telem.appliedState = state.ledOn ? 1 : 0;
+    telem.appliedAutomatic = state.automaticMode ? 1 : 0;
     telem.halfVoltageMv = batteryMv;
     telem.operatingSeconds = totalOperatingSeconds();
     telem.lastChargedDate = secondsSinceLastCharge();
@@ -414,6 +421,14 @@ namespace fc
     ensurePeer(cmd.mac, cmd.header.channel);
 
     updateBrightness(cmd.payload.brightness);
+
+    bool newAutomatic = cmd.payload.automatic != 0;
+    if (state.automaticMode != newAutomatic)
+    {
+      state.automaticMode = newAutomatic;
+      state.stateDirty = true;
+    }
+
     markLedState(cmd.payload.state != 0);
     applyLedState();
 
@@ -448,6 +463,17 @@ namespace fc
     {
       saveState();
     }
+  }
+
+  static void disableLedForAutomaticTimeout()
+  {
+    if (!state.automaticMode)
+      return;
+    if (!state.ledOn)
+      return;
+
+    markLedState(false);
+    applyLedState();
   }
 
   static void sendHeartbeat()
@@ -671,6 +697,11 @@ void loop()
     }
 
     delay(20); // Small delay to prevent busy-waiting
+  }
+
+  if (!fc::telemetryAcked)
+  {
+    fc::disableLedForAutomaticTimeout();
   }
 
   const bool shouldSendHeartbeat = !fc::telemetryAcked;
