@@ -481,11 +481,6 @@ namespace fc
     if (!state.peerKnown)
       return;
 
-    // if (++telemetrySeq == 0)
-    // {
-    //   ++telemetrySeq;
-    // }
-
     sendTelemetry(state.peerMac, state.lastLogicalChannel, false);
   }
 
@@ -689,7 +684,7 @@ void loop()
     if (fc::awaitingTelemetryAck && !ackTimeoutLogged)
     {
       uint64_t elapsedUs = fc::microsNow() - fc::telemetrySentUs;
-      if (elapsedUs > 200000ULL)
+      if (elapsedUs > ACTIVE_WINDOW_MS * 1000ULL)
       {
         Serial.println("WARN: telemetry ACK timeout");
         ackTimeoutLogged = true;
