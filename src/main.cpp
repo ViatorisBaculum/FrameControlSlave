@@ -653,8 +653,8 @@ void setup()
 {
   fc::initHardware();
   fc::loadState();
-  fc::initRadioAfterWake();
   fc::applyLedState();
+  fc::initRadioAfterWake();
   Serial.begin(115200);
 }
 
